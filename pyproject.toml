@@ -51,9 +51,11 @@ cogen = [
     "xlrd>=2",
 ]
 datacenter = [
+    "networkx>=2.8",            # DependencyCriticality only
     "pandas>=1.1, <3",          # semver
     "pytz",
     "requests>=2.31.0",         # semver
+    "scipy>=1.0",               # networkx PageRank
 ]
 evcharging = [
     "acnportal>=0.3.3",

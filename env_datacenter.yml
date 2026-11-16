@@ -18,11 +18,13 @@ dependencies:
 - ipykernel               # for Jupyter / VSCode notebooks
 - matplotlib
 - mypy
+- networkx=3.*            # DependencyCriticality only
 - numpy=1.26.*
 - pandas=2.1.*
 - pip
 - pytz=2023.3
 - requests=2.31.*
+- scipy                   # networkx PageRank
 
 - pip:
   - gymnasium==0.28.1

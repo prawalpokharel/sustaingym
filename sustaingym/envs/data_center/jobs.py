@@ -47,6 +47,10 @@ class Job:
     """step at which the job finished, or -1"""
     missed: bool = False
     """whether the job has passed its deadline unfinished"""
+    parents: tuple[int, ...] = ()
+    """ids of jobs that must finish before this job can start"""
+    tier: int = 0
+    """operator-declared criticality: 0 for normal jobs, 1 for critical ones"""
 
     @property
     def latest_start(self) -> int:
@@ -209,6 +213,82 @@ class SyntheticJobGenerator(JobGenerator):
                            1, self.max_duration_steps).astype(int)
         gpus = rng.choice(sizes, size=n, p=size_p)
         return arrival.astype(int), duration, gpus.astype(int)
+
+
+class DependencyJobGenerator(JobGenerator):
+    """Adds random dependencies between jobs and criticality tiers to another
+    generator's jobs.
+
+    The base generator draws the jobs first. Tiers and dependencies are then
+    drawn from a child generator seeded by one draw from ``rng``, so a seed
+    gives the same base jobs with and without this wrapper. That extra draw
+    does advance ``rng``, so later episodes reset without a seed pick
+    different days than they would without the wrapper.
+
+    Each job is critical (``tier=1``) with probability ``critical_frac``.
+    Going through the jobs in arrival order, each one becomes a child with
+    probability ``dep_prob``. It then takes one parent, or two with
+    probability ``two_parent_prob``, drawn uniformly from earlier jobs that
+    arrived at most ``window_hours`` before it and that, started on arrival,
+    finish before the child's latest start. This check ignores the parent's
+    own parents and GPU contention. If no earlier job qualifies, the job stays
+    independent. Deadlines are not changed, so a parent that waits too long
+    makes its child miss.
+
+    Args:
+        base: generator of the underlying jobs
+        dep_prob: probability that a job depends on earlier jobs
+        two_parent_prob: probability that a dependent job has two parents
+        window_hours: how far back a parent's arrival may be
+        critical_frac: probability that a job is critical
+
+    Attributes:
+        base: JobGenerator, generator of the underlying jobs
+        dep_prob: float, probability that a job depends on earlier jobs
+        two_parent_prob: float, probability of a second parent
+        window_steps: int, how far back a parent's arrival may be, in steps
+        critical_frac: float, probability that a job is critical
+    """
+    def __init__(self, base: JobGenerator, dep_prob: float = 0.4,
+                 two_parent_prob: float = 0.3, window_hours: float = 6.0,
+                 critical_frac: float = 0.2):
+        for name, p in [('dep_prob', dep_prob), ('two_parent_prob', two_parent_prob),
+                        ('critical_frac', critical_frac)]:
+            if not 0.0 <= p <= 1.0:
+                raise ValueError(f'{name} must be in [0, 1]')
+        self.base = base
+        self.max_slack_steps = base.max_slack_steps
+        self.max_duration_steps = base.max_duration_steps
+        self.workload_rule = base.workload_rule
+        self.mix = base.mix
+        self.dep_prob = dep_prob
+        self.two_parent_prob = two_parent_prob
+        self.window_steps = int(round(window_hours * STEPS_PER_HOUR))
+        self.critical_frac = critical_frac
+
+    def available_days(self) -> list[pd.Timestamp] | None:
+        return self.base.available_days()
+
+    def generate(self, day: pd.Timestamp, num_gpus: int,
+                 rng: np.random.Generator) -> list[Job]:
+        jobs = self.base.generate(day, num_gpus, rng)
+        sub = np.random.default_rng(int(rng.integers(2**63)))
+        tiers = sub.random(len(jobs)) < self.critical_frac
+        for job, critical in zip(jobs, tiers):
+            job.tier = int(critical)
+        for i, child in enumerate(jobs):
+            if sub.random() >= self.dep_prob:
+                continue
+            candidates = [p.job_id for p in jobs[:i]
+                          if child.arrival - p.arrival <= self.window_steps
+                          and p.arrival + p.duration <= child.latest_start]
+            if not candidates:
+                continue
+            k = 2 if sub.random() < self.two_parent_prob else 1
+            k = min(k, len(candidates))
+            picked = sub.choice(len(candidates), size=k, replace=False)
+            child.parents = tuple(sorted(candidates[j] for j in picked))
+        return jobs
 
 
 class TraceJobGenerator(JobGenerator):

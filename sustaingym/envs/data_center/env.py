@@ -35,6 +35,13 @@ class DataCenterEnv(Env[np.ndarray, np.ndarray]):
     rate (MOER) of a California balancing authority, plus a penalty for each
     job that passes its deadline unfinished.
 
+    Jobs may list parents (see `DependencyJobGenerator`). A job with parents
+    joins the queue only once its arrival step has passed and every parent
+    has finished. Jobs may also carry a criticality ``tier``, which the
+    environment only counts in ``episode_summary``. Neither is part of the
+    observation or the reward yet, so only policies that read ``jobs``
+    directly can use them.
+
     Energy comes from a power model (see power.py). Episodes last
     ``horizon_days`` from local midnight. Jobs only arrive on the first day,
     so every policy is charged over the same window.
@@ -115,6 +122,7 @@ class DataCenterEnv(Env[np.ndarray, np.ndarray]):
         jobs: list[Job], all jobs of the current episode
         queue: list[Job], jobs waiting to start
         running: list[Job], jobs holding GPUs
+        blocked: list[Job], arrived jobs waiting for a parent to finish
     """
     metadata: dict[str, Any] = {'render_modes': []}
 
@@ -195,6 +203,7 @@ class DataCenterEnv(Env[np.ndarray, np.ndarray]):
         self.jobs: list[Job] = []
         self.queue: list[Job] = []
         self.running: list[Job] = []
+        self.blocked: list[Job] = []
         self.t = 0
 
     @staticmethod
@@ -236,9 +245,14 @@ class DataCenterEnv(Env[np.ndarray, np.ndarray]):
             summary: dict with ``carbon_kg`` (and its ``active_``, ``idle_`` and
                 ``start_`` parts), ``energy_kwh`` (likewise split into
                 ``active_kwh``, ``idle_kwh`` and ``start_kwh``), ``misses``,
-                ``jobs``, ``finished``, ``mean_wait_h`` and ``day``
+                ``critical_misses`` (misses of jobs with ``tier > 0``),
+                ``dependent_misses`` (misses of jobs with parents), ``jobs``,
+                ``finished``, ``mean_wait_h`` (from arrival to start, so it
+                includes time spent waiting for parents) and ``day``
         """
         s: dict[str, Any] = dict(self._totals)
+        s['critical_misses'] = sum(j.missed and j.tier > 0 for j in self.jobs)
+        s['dependent_misses'] = sum(j.missed and len(j.parents) > 0 for j in self.jobs)
         s['jobs'] = len(self.jobs)
         s['finished'] = sum(j.finish >= 0 for j in self.jobs)
         waits = [j.start - j.arrival for j in self.jobs if j.start >= 0]
@@ -278,6 +292,11 @@ class DataCenterEnv(Env[np.ndarray, np.ndarray]):
         self.jobs = self.job_generator.generate(self.day, self.num_gpus, self.np_random)
         if any(j.deadline > self.horizon for j in self.jobs):
             raise ValueError('a job is due after the end of the episode; raise horizon_days')
+        if any(j.parents for j in self.jobs):
+            for i, job in enumerate(self.jobs):
+                if job.job_id != i or any(not 0 <= p < i for p in job.parents):
+                    raise ValueError('with dependencies, job ids must be list '
+                                     'positions and parents must be earlier jobs')
         self._arrivals: dict[int, list[Job]] = {}
         for job in self.jobs:
             self._arrivals.setdefault(job.arrival, []).append(job)
@@ -286,14 +305,28 @@ class DataCenterEnv(Env[np.ndarray, np.ndarray]):
         self._job_power = {w: self.power.active_w(self.gpu, w)
                            for w in {j.workload for j in self.jobs}}
 
-        self.queue, self.running = [], []
+        self.queue, self.running, self.blocked = [], [], []
         self.t = 0
         self._totals = dict(carbon_kg=0.0, active_carbon_kg=0.0,
                             idle_carbon_kg=0.0, start_carbon_kg=0.0,
                             energy_kwh=0.0, active_kwh=0.0, idle_kwh=0.0,
                             start_kwh=0.0, misses=0)
-        self.queue.extend(self._arrivals.get(0, []))
+        self._admit(self._arrivals.get(0, []))
         return self._obs(), {'day': str(self.day.date()), 'jobs': len(self.jobs)}
+
+    def _admit(self, arrivals: list[Job]) -> None:
+        """Queues new arrivals and blocked jobs whose parents have all finished."""
+        waiting = self.blocked + arrivals
+        if not any(j.parents for j in waiting):
+            self.queue.extend(waiting)
+            self.blocked = []
+            return
+        self.blocked = []
+        for job in waiting:
+            if all(self.jobs[p].finish >= 0 for p in job.parents):
+                self.queue.append(job)
+            else:
+                self.blocked.append(job)
 
     def step(self, action: np.ndarray
              ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
@@ -337,13 +370,13 @@ class DataCenterEnv(Env[np.ndarray, np.ndarray]):
         for job in finished:
             job.finish = self.t
             self.running.remove(job)
-        self.queue.extend(self._arrivals.get(self.t, []))
+        self._admit(self._arrivals.get(self.t, []))
 
         truncated = self.t >= self.horizon
         new_misses = 0
         # earlier finishers were checked when they finished; an unfinished
         # job is late once t reaches its deadline (deadlines <= horizon)
-        for job in finished + self.queue + self.running:
+        for job in finished + self.queue + self.running + self.blocked:
             late = job.finish > job.deadline if job.finish >= 0 else self.t >= job.deadline
             if late and not job.missed:
                 job.missed = True

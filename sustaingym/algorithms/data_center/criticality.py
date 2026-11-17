@@ -116,7 +116,8 @@ class DependencyCriticality(DataCenterPolicy):
             series = np.concatenate([[env.moer_now()], env.moer_forecast()])[:n]
             h = signal_entropy(series)
         r = min(max(float(job.tier), 0.0), 1.0)
-        # rounded so that float noise across CPUs cannot move the hold limit
+        # rounded to 9 places so tiny float differences between machines
+        # rarely change the hold limit
         return round(alpha * c + beta * h + gamma * r, 9)
 
     def start_now(self, job: Job, latest_start: int) -> bool:
